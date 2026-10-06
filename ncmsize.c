@@ -13,9 +13,9 @@
  * while running.
  *
  * -d run watches for new adapters (IOKit), interface changes (a kernel event
- * socket) and wakes (IORegisterForSystemPower), checks the adapters 1, 4 and
- * 10 seconds after each, and once a minute in any case.  -d on writes a
- * launchd agent that runs it at every login.
+ * socket) and wakes (IORegisterForSystemPower), and checks the adapters 1
+ * second after each, once macOS has set its own size; it does nothing in
+ * between.  -d on writes a launchd agent that runs it at every login.
  *
  * Build: clang -O2 -o ncmsize ncmsize.c -framework IOKit -framework CoreFoundation
  */
@@ -65,8 +65,8 @@
 #define MAX_ADAPTERS		16
 
 /* Watch mode */
-#define SAFETY_CHECK		60.0	/* seconds between checks without any event */
-#define MAX_PENDING		32
+#define CHECK_DELAY		1.0	/* seconds from an event to the check */
+#define NEVER			1.0e9	/* the check timer waits until an event sets it */
 
 /* Background mode */
 #define AGENT_LABEL		"local.ncmsize"
@@ -147,8 +147,7 @@ static struct {
 } said[MAX_ADAPTERS];
 static char watched[MAX_ADAPTERS][IFNAMSIZ];
 static int nwatched;
-static CFAbsoluteTime pending[MAX_PENDING], next_safety;
-static int npending;
+static CFRunLoopTimerRef check_timer;
 static io_connect_t root_port;
 static int started;
 
@@ -606,10 +605,8 @@ static int run(struct adapter *a, int set)
 			return 1;
 		if (!targeted(a->version))
 			snprintf(skip, sizeof(skip), "; -b skips it without -c %s", pick_arg(a));
-		report(a, stdout, "%s (%s): blocks of up to %u bytes (macOS sets %u)%s%s", a->name,
-		       label(a), before, a->read_size, interface_up(a->name) == 0 ?
-		       "; the interface is down, macOS sets its own size when it comes up" : "",
-		       skip);
+		report(a, stdout, "%s (%s): blocks of up to %u bytes%s%s", a->name, label(a), before,
+		       interface_up(a->name) == 0 ? " (interface down)" : "", skip);
 		return 0;
 	}
 
@@ -625,7 +622,7 @@ static int run(struct adapter *a, int set)
 		return 2;
 	}
 	if (up == 0)
-		note = "; the interface is down, macOS sets its own size when it comes up";
+		note = " (interface down)";
 
 	if (get_size(a, &n, &before))
 		return 1;
@@ -735,35 +732,17 @@ static int run_all(int set)
 	return ret;
 }
 
-/* Watch mode: checks 1, 4 and 10 seconds after an event */
-static void schedule_checks(void)
+/* Watch mode: checks the adapters 1 second after the last event */
+static void schedule_check(void)
 {
-	static const double delays[] = { 1, 4, 10 };
-	CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-	size_t i;
-
-	for (i = 0; i < sizeof(delays) / sizeof(delays[0]) && npending < MAX_PENDING; i++)
-		pending[npending++] = now + delays[i];
+	CFRunLoopTimerSetNextFireDate(check_timer, CFAbsoluteTimeGetCurrent() + CHECK_DELAY);
 }
 
-static void tick(CFRunLoopTimerRef timer, void *info)
+static void check(CFRunLoopTimerRef timer, void *info)
 {
-	CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-	int i, j, due = 0;
-
 	(void)timer;
 	(void)info;
-	for (i = j = 0; i < npending; i++) {
-		if (pending[i] <= now)
-			due = 1;
-		else
-			pending[j++] = pending[i];
-	}
-	npending = j;
-	if (due || now >= next_safety) {
-		next_safety = now + SAFETY_CHECK;
-		run_all(1);
-	}
+	run_all(1);
 }
 
 /* Apple's NCM driver attached to a device (or was already attached at start) */
@@ -780,7 +759,7 @@ static void matched(void *ctx, io_iterator_t it)
 	if (n && started)
 		say(stdout, "an adapter was plugged in");
 	if (n)
-		schedule_checks();
+		schedule_check();
 }
 
 /* A network interface changed: flags (up, down), link, or a new interface */
@@ -807,7 +786,7 @@ static void kernel_event(CFFileDescriptorRef fdref, CFOptionFlags flags, void *i
 		snprintf(name, sizeof(name), "%s%u", d->if_name, d->if_unit);
 		if (m->event_code == KEV_DL_IF_ATTACHED && !strncmp(name, "en", 2)) {
 			say(stdout, "%s appeared", name);
-			schedule_checks();
+			schedule_check();
 			continue;
 		}
 		for (i = 0; i < nwatched; i++)
@@ -820,7 +799,7 @@ static void kernel_event(CFFileDescriptorRef fdref, CFOptionFlags flags, void *i
 					say(stdout, "%s", line);
 				strlcpy(last, line, sizeof(last));
 				last_time = CFAbsoluteTimeGetCurrent();
-				schedule_checks();
+				schedule_check();
 			}
 	}
 	CFFileDescriptorEnableCallBacks(fdref, kCFFileDescriptorReadCallBack);
@@ -837,7 +816,7 @@ static void power_event(void *ctx, io_service_t service, natural_t type, void *a
 		break;
 	case kIOMessageSystemHasPoweredOn:
 		say(stdout, "the Mac woke up");
-		schedule_checks();
+		schedule_check();
 		break;
 	}
 }
@@ -850,13 +829,16 @@ static int watch(void)
 	io_iterator_t it;
 	CFFileDescriptorRef fdref;
 	CFRunLoopSourceRef src;
-	CFRunLoopTimerRef timer;
 	CFRunLoopRef loop = CFRunLoopGetCurrent();
 	int fd;
 
 	watching = 1;
 	say(stdout, "ncmsize: keeping blocks of up to %u bytes on %s adapters%s%s", want, picked,
 	    want_if ? " behind " : "", want_if ? want_if : "");
+
+	check_timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + NEVER, NEVER, 0, 0,
+					   check, NULL);
+	CFRunLoopAddTimer(loop, check_timer, kCFRunLoopDefaultMode);
 
 	port = IONotificationPortCreate(kIOMainPortDefault);
 	CFRunLoopAddSource(loop, IONotificationPortGetRunLoopSource(port), kCFRunLoopDefaultMode);
@@ -887,9 +869,6 @@ static int watch(void)
 	CFRunLoopAddSource(loop, IONotificationPortGetRunLoopSource(power_port),
 			   kCFRunLoopDefaultMode);
 
-	next_safety = 0;	/* first check at the first tick */
-	timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 1, 1, 0, 0, tick, NULL);
-	CFRunLoopAddTimer(loop, timer, kCFRunLoopDefaultMode);
 	CFRunLoopRun();
 	return 0;
 }

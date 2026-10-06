@@ -14,7 +14,8 @@
  *
  * -d run watches for new adapters (IOKit), interface changes (a kernel event
  * socket) and wakes (IORegisterForSystemPower), and checks the adapters 1
- * second after each, once macOS has set its own size; it does nothing in
+ * second after each, once macOS has set its own size; a check that fails on a
+ * USB error is tried again 5 seconds later, up to 3 times.  It does nothing in
  * between.  -d on writes a launchd agent that runs it at every login.
  *
  * Build: clang -O2 -o ncmsize ncmsize.c -framework IOKit -framework CoreFoundation
@@ -22,6 +23,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pwd.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -63,10 +65,13 @@
 #define RTL_VERSION_MASK	0x7cf0
 
 #define MAX_ADAPTERS		16
+#define USB_TIMEOUT_MS		1000	/* a control request that takes longer has failed */
 
 /* Watch mode */
 #define CHECK_DELAY		1.0	/* seconds from an event to the check */
 #define NEVER			1.0e9	/* the check timer waits until an event sets it */
+#define RETRY_DELAY		5.0	/* seconds before a check that failed is tried again */
+#define MAX_RETRIES		3
 
 /* Background mode */
 #define AGENT_LABEL		"local.ncmsize"
@@ -94,18 +99,21 @@ static const struct {
 static const struct chip {
 	const char *name;
 	const char *label;
+	const char *later;		/* the label when bcdDevice is later than ... */
+	uint16_t release;		/* ... this one, with the same high byte */
 	uint16_t version[4];
 } chips[] = {
-	{ "rtl8156b", "RTL8156B", { 0x7400, 0x7410 } },
-	{ "rtl8157", "RTL8157", { 0x1030 } },
-	{ "rtl8159", "RTL8159", { 0x2020 } },
-	{ "rtl8156", "original RTL8156", { 0x7020, 0x7030 } },
-	{ "rtl8153", "RTL8153", { 0x5c00, 0x5c10, 0x5c20, 0x5c30 } },
-	{ "rtl8153b", "RTL8153B", { 0x6000, 0x6010 } },
-	{ "rtl8153c", "RTL8153C", { 0x6400 } },
-	{ "rtl8153d", "RTL8153D", { 0x7420 } },
-	{ "rtl8152", "RTL8152", { 0x4c00, 0x4c10 } },
-	{ "rtl8050", "RTL8050", { 0x4800 } },
+	/* bcdDevice 0x3100 is the RTL8156B; later 0x31xx (0x3104, 0x3105, Ugreen's 0x31f4) the BG */
+	{ "rtl8156b", "RTL8156B", "RTL8156BG", 0x3100, { 0x7400, 0x7410 } },
+	{ "rtl8157", "RTL8157", NULL, 0, { 0x1030 } },
+	{ "rtl8159", "RTL8159", NULL, 0, { 0x2020 } },
+	{ "rtl8156", "original RTL8156", NULL, 0, { 0x7020, 0x7030 } },
+	{ "rtl8153", "RTL8153", NULL, 0, { 0x5c00, 0x5c10, 0x5c20, 0x5c30 } },
+	{ "rtl8153b", "RTL8153B", NULL, 0, { 0x6000, 0x6010 } },
+	{ "rtl8153c", "RTL8153C", NULL, 0, { 0x6400 } },
+	{ "rtl8153d", "RTL8153D", NULL, 0, { 0x7420 } },
+	{ "rtl8152", "RTL8152", NULL, 0, { 0x4c00, 0x4c10 } },
+	{ "rtl8050", "RTL8050", NULL, 0, { 0x4800 } },
 };
 #define NCHIPS		(sizeof(chips) / sizeof(chips[0]))
 #define NVERSIONS	(sizeof(chips[0].version) / sizeof(chips[0].version[0]))
@@ -115,7 +123,7 @@ static const struct chip {
 /* An adapter run by Apple's NCM driver (AppleUSBNCMData) */
 struct adapter {
 	io_service_t usb;		/* its IOUSBHostDevice */
-	IOUSBDeviceInterface **dev;
+	IOUSBDeviceInterface182 **dev;	/* 182 has DeviceRequestTO */
 	char name[IFNAMSIZ];		/* its network interface */
 	unsigned int vid, pid;
 	unsigned int release;		/* bcdDevice: tells an RTL8156BG from an RTL8156B */
@@ -123,18 +131,14 @@ struct adapter {
 	unsigned int version;
 	const struct chip *chip;	/* its name, if known */
 	unsigned int read_size;		/* the driver's read size (InputSize) */
-};
-
-/* What the current configuration's descriptors say */
-struct ncm {
 	int ifnum;			/* NCM control interface */
 	uint16_t size_len;		/* GET/SET_NTB_INPUT_SIZE length: 4 or 8 */
 };
 
 /* Settings from the command line */
-static uint16_t targets[MAX_TARGETS] = { 0x7400, 0x7410 };	/* rtl8156 */
-static int ntargets = 2;
-static char picked[128] = "RTL8156B";
+static uint16_t targets[MAX_TARGETS];
+static int ntargets;
+static char picked[128];
 static const char *chips_arg;
 static const char *want_if;
 static unsigned int want;
@@ -148,6 +152,7 @@ static struct {
 static char watched[MAX_ADAPTERS][IFNAMSIZ];
 static int nwatched;
 static CFRunLoopTimerRef check_timer;
+static int retries;
 static io_connect_t root_port;
 static int started;
 
@@ -174,9 +179,10 @@ static int usage(void)
 }
 
 /* Prints a line, with the time first in watch mode */
-static void vsay(FILE *f, const char *fmt, va_list ap)
+static void say(FILE *f, const char *fmt, ...)
 {
 	char stamp[32];
+	va_list ap;
 	time_t t;
 
 	if (watching) {
@@ -184,18 +190,11 @@ static void vsay(FILE *f, const char *fmt, va_list ap)
 		strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S ", localtime(&t));
 		fputs(stamp, f);
 	}
+	va_start(ap, fmt);
 	vfprintf(f, fmt, ap);
+	va_end(ap);
 	fputc('\n', f);
 	fflush(f);
-}
-
-static void say(FILE *f, const char *fmt, ...)
-{
-	va_list ap;
-
-	va_start(ap, fmt);
-	vsay(f, fmt, ap);
-	va_end(ap);
 }
 
 /* In watch mode, what was last said about an adapter, so it is said once */
@@ -330,7 +329,7 @@ static int open_device(struct adapter *a)
 		       mach_error_string(kr), (unsigned int)kr);
 		return -1;
 	}
-	(*plug)->QueryInterface(plug, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID),
+	(*plug)->QueryInterface(plug, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID182),
 				(LPVOID *)&a->dev);
 	(*plug)->Release(plug);
 	if (!a->dev) {
@@ -351,15 +350,17 @@ static void close_device(struct adapter *a)
 static int request(struct adapter *a, uint8_t type, uint8_t req, uint16_t value,
 		   uint16_t index, void *buf, uint16_t len)
 {
-	IOUSBDevRequest r = {
+	IOUSBDevRequestTO r = {
 		.bmRequestType = type,
 		.bRequest = req,
 		.wValue = value,
 		.wIndex = index,
 		.wLength = len,
 		.pData = buf,
+		.noDataTimeout = USB_TIMEOUT_MS,
+		.completionTimeout = USB_TIMEOUT_MS,
 	};
-	IOReturn kr = (*a->dev)->DeviceRequest(a->dev, &r);
+	IOReturn kr = (*a->dev)->DeviceRequestTO(a->dev, &r);
 
 	if (kr != kIOReturnSuccess) {
 		/* the adapter stalls a size it does not accept; run() says so */
@@ -406,13 +407,9 @@ static const char *label(const struct adapter *a)
 	static char buf[48];
 	const char *name = a->chip ? a->chip->label : "unknown chip";
 
-	/*
-	 * bcdDevice 0x3100 is the RTL8156B; the later 0x31xx values (0x3104,
-	 * 0x3105, Ugreen's 0x31f4) are RTL8156BG adapters
-	 */
-	if (a->chip && !strcmp(a->chip->name, "rtl8156b") && (a->release & 0xff00) == 0x3100 &&
-	    a->release != 0x3100)
-		name = "RTL8156BG";
+	if (a->chip && a->chip->later && (a->release & 0xff00) == (a->chip->release & 0xff00) &&
+	    a->release != a->chip->release)
+		name = a->chip->later;
 	snprintf(buf, sizeof(buf), "%s, 0x%04x", name, a->version);
 	return buf;
 }
@@ -443,9 +440,9 @@ static int targeted(unsigned int ver)
  * without any USB request.  Returns 0, -1 when the configuration has no NCM
  * interface, or -2 when the descriptors cannot be read.
  */
-static int find_ncm(struct adapter *a, struct ncm *n)
+static int find_ncm(struct adapter *a)
 {
-	IOUSBDeviceInterface **dev = a->dev;
+	IOUSBDeviceInterface182 **dev = a->dev;
 	IOUSBConfigurationDescriptorPtr cd;
 	const uint8_t *p, *end;
 	unsigned int config;
@@ -466,8 +463,8 @@ static int find_ncm(struct adapter *a, struct ncm *n)
 	if (i == count)
 		return config ? -2 : -1;
 
-	n->ifnum = -1;
-	n->size_len = 0;
+	a->ifnum = -1;
+	a->size_len = 0;
 	p = (const uint8_t *)cd;
 	end = p + USBToHostWord(cd->wTotalLength);
 	for (; p + 2 <= end && p[0] >= 2 && p + p[0] <= end; p += p[0]) {
@@ -478,32 +475,32 @@ static int find_ncm(struct adapter *a, struct ncm *n)
 		} else if (p[1] == kUSBClassSpecificDescriptor && p[0] >= 6 &&
 			   p[2] == NCM_FUNCTIONAL_DESC &&
 			   cls == kUSBCommunicationControlInterfaceClass && sub == NCM_SUBCLASS) {
-			n->ifnum = intf;
-			n->size_len = (p[5] & NCM_NTB_INPUT_SIZE_8) ? 8 : 4;
+			a->ifnum = intf;
+			a->size_len = (p[5] & NCM_NTB_INPUT_SIZE_8) ? 8 : 4;
 		}
 	}
-	return n->ifnum >= 0 ? 0 : -1;
+	return a->ifnum >= 0 ? 0 : -1;
 }
 
-static int get_size(struct adapter *a, const struct ncm *n, unsigned int *size)
+static int get_size(struct adapter *a, unsigned int *size)
 {
 	uint32_t b[2];
 
 	if (request(a, USBmakebmRequestType(kUSBIn, kUSBClass, kUSBInterface), GET_NTB_INPUT_SIZE,
-		    0, n->ifnum, b, n->size_len))
+		    0, (uint16_t)a->ifnum, b, a->size_len))
 		return -1;
 	*size = OSReadLittleInt32(b, 0);
 	return 0;
 }
 
-static int set_size(struct adapter *a, const struct ncm *n, unsigned int size)
+static int set_size(struct adapter *a, unsigned int size)
 {
 	/* dwNtbInMaxSize; in the 8-byte form, wNtbInMaxDatagrams 0 (no limit) */
 	uint32_t b[2] = { 0 };
 
 	OSWriteLittleInt32(b, 0, size);
 	return request(a, USBmakebmRequestType(kUSBOut, kUSBClass, kUSBInterface),
-		       SET_NTB_INPUT_SIZE, 0, n->ifnum, b, n->size_len);
+		       SET_NTB_INPUT_SIZE, 0, (uint16_t)a->ifnum, b, a->size_len);
 }
 
 /* 1 if the network interface is up, 0 if down, -1 if unknown */
@@ -560,10 +557,10 @@ static int parse_chips(const char *arg)
 			continue;
 		}
 		ret = -1;
-		if (strncmp(tok, "0x", 2) || !tok[2])
+		if (strncmp(tok, "0x", 2))
 			break;
 		errno = 0;
-		v = strtoul(tok + 2, &end, 16);
+		v = strtoul(tok, &end, 16);
 		if (*end || errno || !v || v & ~(unsigned long)RTL_VERSION_MASK ||
 		    ntargets == MAX_TARGETS)
 			break;
@@ -584,10 +581,9 @@ static int is_mode(const char *s)
 /* Shows or sets the block size of one adapter; returns an exit status */
 static int run(struct adapter *a, int set)
 {
-	struct ncm n;
 	unsigned int before, now;
 	const char *note = "";
-	int up, ret = find_ncm(a, &n);
+	int up, ret = find_ncm(a);
 
 	if (ret == -1) {
 		report(a, stderr, "%s: not in NCM mode", a->name);
@@ -601,7 +597,7 @@ static int run(struct adapter *a, int set)
 	if (!set) {
 		char skip[48] = "";
 
-		if (get_size(a, &n, &before))
+		if (get_size(a, &before))
 			return 1;
 		if (!targeted(a->version))
 			snprintf(skip, sizeof(skip), "; -b skips it without -c %s", pick_arg(a));
@@ -624,19 +620,19 @@ static int run(struct adapter *a, int set)
 	if (up == 0)
 		note = " (interface down)";
 
-	if (get_size(a, &n, &before))
+	if (get_size(a, &before))
 		return 1;
 	if (before == want) {
 		report(a, stdout, "%s (%s): blocks of up to %u bytes already%s", a->name, label(a),
 		       before, note);
 		return 0;
 	}
-	ret = set_size(a, &n, want);
+	ret = set_size(a, want);
 	if (ret == -2)
 		report(a, stderr, "%s: the adapter refused blocks of %u bytes", a->name, want);
 	if (ret)
 		return ret == -2 ? 2 : 1;
-	if (get_size(a, &n, &now)) {
+	if (get_size(a, &now)) {
 		report(a, stderr, "%s: asked for %u bytes (was %u), but reading the size back failed",
 		       a->name, want, before);
 		return 1;
@@ -692,6 +688,8 @@ static int run_all(int set)
 					done++;
 			}
 		} else if (open_device(a) || identify_chip(a)) {
+			/* keep watching it: a later check may get through */
+			strlcpy(watched[nwatched++], a->name, IFNAMSIZ);
 			r = 1;
 		} else {
 			snprintf(found + strlen(found), sizeof(found) - strlen(found), "%s%s (%s)",
@@ -715,19 +713,28 @@ static int run_all(int set)
 	}
 
 	if (!done && !ret) {
-		if (watching)
-			return 0;	/* nothing to do until an adapter shows up */
+		static char last[256];
+		char msg[256];
+
 		if (want_if)
-			say(stderr, "no Realtek adapter behind %s; plugged in:%s", want_if,
-			    *names ? names : " none");
+			snprintf(msg, sizeof(msg), "no Realtek adapter behind %s; plugged in:%s",
+				 want_if, *names ? names : " none");
 		else if (*found)
-			say(stderr, "no adapter with %s plugged in; found: %s", picked, found);
+			snprintf(msg, sizeof(msg), "no adapter with %s plugged in; found: %s", picked,
+				 found);
 		else if (all)
-			say(stderr, "no adapter run by macOS's NCM driver is plugged in");
+			snprintf(msg, sizeof(msg), "no adapter run by macOS's NCM driver is plugged in");
 		else
-			say(stderr, "no adapter with %s run by macOS's NCM driver is plugged in",
-			    picked);
-		return 1;
+			snprintf(msg, sizeof(msg),
+				 "no adapter with %s run by macOS's NCM driver is plugged in", picked);
+		if (!watching) {
+			say(stderr, "%s", msg);
+			return 1;
+		}
+		/* in watch mode, once, and nothing while no adapter is plugged in */
+		if (count && strcmp(msg, last))
+			say(stdout, "%s", msg);
+		strlcpy(last, count ? msg : "", sizeof(last));
 	}
 	return ret;
 }
@@ -735,6 +742,7 @@ static int run_all(int set)
 /* Watch mode: checks the adapters 1 second after the last event */
 static void schedule_check(void)
 {
+	retries = 0;
 	CFRunLoopTimerSetNextFireDate(check_timer, CFAbsoluteTimeGetCurrent() + CHECK_DELAY);
 }
 
@@ -742,7 +750,9 @@ static void check(CFRunLoopTimerRef timer, void *info)
 {
 	(void)timer;
 	(void)info;
-	run_all(1);
+	/* a USB error may pass once the adapter has settled */
+	if (run_all(1) == 1 && retries++ < MAX_RETRIES)
+		CFRunLoopTimerSetNextFireDate(check_timer, CFAbsoluteTimeGetCurrent() + RETRY_DELAY);
 }
 
 /* Apple's NCM driver attached to a device (or was already attached at start) */
@@ -920,31 +930,35 @@ static int launchctl(const char *a1, const char *a2, const char *a3)
 	return launchctl_out(a1, a2, a3, NULL, 0);
 }
 
+/* In the home of the user whose launchd domain is gui/<uid>, even under sudo */
 static void home_path(char *buf, size_t len, const char *rel)
 {
-	const char *home = getenv("HOME");
+	struct passwd *pw = getpwuid(getuid());
 
-	snprintf(buf, len, "%s/%s", home ? home : "", rel);
+	snprintf(buf, len, "%s/%s", pw ? pw->pw_dir : "", rel);
 }
 
-static void add_string(CFMutableArrayRef array, const char *s)
+static int add_string(CFMutableArrayRef array, const char *s)
 {
 	CFStringRef str = CFStringCreateWithCString(NULL, s, kCFStringEncodingUTF8);
 
+	if (!str)
+		return -1;
 	CFArrayAppendValue(array, str);
 	CFRelease(str);
+	return 0;
 }
 
 static int write_agent(const char *plist, const char *log)
 {
 	char exe[PATH_MAX], real[PATH_MAX], size[16];
 	uint32_t exe_len = sizeof(exe);
-	CFMutableDictionaryRef d;
+	CFMutableDictionaryRef d, keep;
 	CFMutableArrayRef args;
 	CFStringRef logstr;
 	CFDataRef data;
 	FILE *f;
-	int ok;
+	int ok, bad;
 
 	if (_NSGetExecutablePath(exe, &exe_len) || !realpath(exe, real)) {
 		say(stderr, "cannot find where ncmsize itself is");
@@ -952,31 +966,36 @@ static int write_agent(const char *plist, const char *log)
 	}
 	snprintf(size, sizeof(size), "%u", want);
 	args = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-	add_string(args, real);
-	add_string(args, "-d");
-	add_string(args, "run");
-	add_string(args, "-b");
-	add_string(args, size);
-	if (chips_arg) {
-		add_string(args, "-c");
-		add_string(args, chips_arg);
-	}
-	if (want_if) {
-		add_string(args, "-i");
-		add_string(args, want_if);
+	bad = add_string(args, real) | add_string(args, "-d") | add_string(args, "run") |
+	      add_string(args, "-b") | add_string(args, size);
+	if (chips_arg)
+		bad |= add_string(args, "-c") | add_string(args, chips_arg);
+	if (want_if)
+		bad |= add_string(args, "-i") | add_string(args, want_if);
+	logstr = CFStringCreateWithCString(NULL, log, kCFStringEncodingUTF8);
+	if (bad || !logstr) {
+		say(stderr, "cannot set up the agent: a path or a setting is not valid UTF-8");
+		CFRelease(args);
+		if (logstr)
+			CFRelease(logstr);
+		return -1;
 	}
 
-	logstr = CFStringCreateWithCString(NULL, log, kCFStringEncodingUTF8);
+	/* restart it after a crash only: an agent that cannot start would loop every 10 s */
+	keep = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+					 &kCFTypeDictionaryValueCallBacks);
+	CFDictionarySetValue(keep, CFSTR("Crashed"), kCFBooleanTrue);
 	d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
 				      &kCFTypeDictionaryValueCallBacks);
 	CFDictionarySetValue(d, CFSTR("Label"), CFSTR(AGENT_LABEL));
 	CFDictionarySetValue(d, CFSTR("ProgramArguments"), args);
 	CFDictionarySetValue(d, CFSTR("RunAtLoad"), kCFBooleanTrue);
-	CFDictionarySetValue(d, CFSTR("KeepAlive"), kCFBooleanTrue);
+	CFDictionarySetValue(d, CFSTR("KeepAlive"), keep);
 	CFDictionarySetValue(d, CFSTR("StandardOutPath"), logstr);
 	CFDictionarySetValue(d, CFSTR("StandardErrorPath"), logstr);
 	data = CFPropertyListCreateData(NULL, d, kCFPropertyListXMLFormat_v1_0, 0, NULL);
 	CFRelease(d);
+	CFRelease(keep);
 	CFRelease(args);
 	CFRelease(logstr);
 	if (!data)
@@ -996,21 +1015,23 @@ static int write_agent(const char *plist, const char *log)
 /* -d on: (re)installs the launchd agent; -d off: removes it */
 static int background(int off)
 {
-	char plist[PATH_MAX], log[PATH_MAX], dir[PATH_MAX], domain[32], service[64];
-	int i, loaded;
+	char plist[PATH_MAX], tmp[PATH_MAX], log[PATH_MAX], dir[PATH_MAX], domain[32], service[64];
+	int i, loaded, removed;
 
 	home_path(plist, sizeof(plist), AGENT_PLIST);
 	home_path(log, sizeof(log), AGENT_LOG);
 	snprintf(domain, sizeof(domain), "gui/%u", getuid());
 	snprintf(service, sizeof(service), "%s/%s", domain, AGENT_LABEL);
 
-	loaded = launchctl("bootout", service, NULL) == 0;
 	if (off) {
-		if (unlink(plist) && errno == ENOENT && !loaded) {
-			say(stdout, "ncmsize was not running in the background");
-			return 0;
+		loaded = launchctl("bootout", service, NULL) == 0;
+		removed = !unlink(plist);
+		if (!removed && errno != ENOENT) {
+			say(stderr, "cannot remove %s: %s", plist, strerror(errno));
+			return 1;
 		}
-		say(stdout, "ncmsize stopped and removed from the background");
+		say(stdout, loaded || removed ? "ncmsize stopped and removed from the background" :
+		    "ncmsize was not running in the background");
 		return 0;
 	}
 
@@ -1018,8 +1039,18 @@ static int background(int off)
 	mkdir(dir, 0755);
 	home_path(dir, sizeof(dir), "Library/Logs");
 	mkdir(dir, 0755);
-	if (write_agent(plist, log))
+	/* the running agent is only stopped once the new plist is in place */
+	snprintf(tmp, sizeof(tmp), "%s.new", plist);
+	if (write_agent(tmp, log)) {
+		unlink(tmp);
 		return 1;
+	}
+	if (rename(tmp, plist)) {
+		say(stderr, "cannot write %s: %s", plist, strerror(errno));
+		unlink(tmp);
+		return 1;
+	}
+	loaded = launchctl("bootout", service, NULL) == 0;
 	/* a service still being torn down refuses a bootstrap for a moment */
 	for (i = 0; i < 20; i++) {
 		if (!launchctl("bootstrap", domain, plist)) {
@@ -1027,6 +1058,8 @@ static int background(int off)
 			    "adapters%s%s, from every login", loaded ? "restarted" : "started", want,
 			    picked, want_if ? " behind " : "", want_if ? want_if : "");
 			say(stdout, "log: %s; stop it with: ncmsize -d off", log);
+			/* what it does now, with these settings */
+			run_all(1);
 			return 0;
 		}
 		usleep(250000);
@@ -1035,31 +1068,13 @@ static int background(int off)
 	return 1;
 }
 
-/* The value after a "key = " line of launchctl print, or NULL */
-static const char *print_field(const char *text, const char *key, char *buf, size_t len)
-{
-	const char *p = text, *e;
-	size_t klen = strlen(key);
-
-	while ((p = strstr(p, key))) {
-		if ((p == text || p[-1] == '\t' || p[-1] == ' ') && !strncmp(p + klen, " = ", 3)) {
-			p += klen + 3;
-			e = strchr(p, '\n');
-			if (!e)
-				e = p + strlen(p);
-			snprintf(buf, len, "%.*s", (int)(e - p), p);
-			return buf;
-		}
-		p += klen;
-	}
-	return NULL;
-}
-
 /* -d status: is the launchd agent installed and running, and with which settings */
 static int background_status(void)
 {
-	char plist[PATH_MAX], log[PATH_MAX], service[64], text[16384], state[64], pid[32];
+	static char list[1 << 18];
+	char plist[PATH_MAX], log[PATH_MAX], text[16384], pid[32] = "";
 	char settings[512] = "", program[PATH_MAX] = "", line[512] = "", last[512] = "";
+	const char *p;
 	CFArrayRef args = NULL;
 	CFPropertyListRef pl = NULL;
 	CFDataRef data = NULL;
@@ -1069,7 +1084,6 @@ static int background_status(void)
 
 	home_path(plist, sizeof(plist), AGENT_PLIST);
 	home_path(log, sizeof(log), AGENT_LOG);
-	snprintf(service, sizeof(service), "gui/%u/%s", getuid(), AGENT_LABEL);
 
 	f = fopen(plist, "r");
 	if (!f) {
@@ -1105,10 +1119,16 @@ static int background_status(void)
 	if (data)
 		CFRelease(data);
 
-	if (!launchctl_out("print", service, NULL, text, sizeof(text)) &&
-	    print_field(text, "state", state, sizeof(state)) && !strcmp(state, "running") &&
-	    print_field(text, "pid", pid, sizeof(pid)))
-		running = 1;
+	/* launchctl list: "PID<tab>Status<tab>Label" lines, PID "-" when not running */
+	if (!launchctl_out("list", NULL, NULL, list, sizeof(list)) &&
+	    (p = strstr(list, "\t" AGENT_LABEL "\n"))) {
+		while (p > list && p[-1] != '\n')
+			p--;
+		if (*p != '-') {
+			snprintf(pid, sizeof(pid), "%.*s", (int)strcspn(p, "\t"), p);
+			running = 1;
+		}
+	}
 	if (running)
 		say(stdout, "ncmsize runs in the background (pid %s), with: %s", pid, settings);
 	else
@@ -1162,18 +1182,17 @@ int main(int argc, char **argv)
 	}
 	if (optind < argc)
 		return usage();
+	if (!chips_arg)
+		parse_chips("rtl8156b");
 
-	if (mode && (!strcmp(mode, "off") || !strcmp(mode, "status"))) {
+	if (!mode)
+		return run_all(set);
+	if (!strcmp(mode, "off") || !strcmp(mode, "status")) {
 		if (set || chips_arg || want_if)
 			return usage();
 		return !strcmp(mode, "off") ? background(1) : background_status();
 	}
-	if (mode && !set)
+	if (!set)
 		return usage();
-
-	if (mode && !strcmp(mode, "on"))
-		return background(0);
-	if (mode)
-		return watch();
-	return run_all(set);
+	return !strcmp(mode, "on") ? background(0) : watch();
 }
